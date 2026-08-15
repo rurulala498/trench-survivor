@@ -1,0 +1,56 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>참호 2 — 도트 1인칭 · 부위 파괴</title>
+<style>
+  *{margin:0;padding:0;box-sizing:border-box}
+  html,body{height:100%;overflow:hidden;background:#07090c;color:#c9c4b6;
+    font-family:"Pretendard","Malgun Gothic","Segoe UI",sans-serif}
+  #wrap{height:100%;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:10px}
+  #stage{position:relative}
+  canvas{display:block;cursor:none;image-rendering:pixelated;
+    width:1152px;height:648px;max-width:96vw;max-height:78vh;
+    box-shadow:0 0 0 1px rgba(200,190,160,.12), 0 24px 70px rgba(0,0,0,.8)}
+  #hud{position:absolute;left:14px;top:12px;font-size:13px;line-height:1.6;
+    text-shadow:0 2px 0 rgba(0,0,0,.85);pointer-events:none}
+  #hud .row{display:flex;align-items:center;gap:8px;margin-bottom:3px}
+  #hud .k{color:#78828e;font-size:11px;letter-spacing:.04em}
+  #hud b{color:#e6e0cf;font-weight:700;min-width:26px}
+  #hud .gauge{display:inline-block;width:104px;height:7px;background:#191d23;
+    border:1px solid #2b313a;position:relative}
+  #hud .gauge i{display:block;height:100%}
+  #hud .over{margin-top:6px;color:#e0553c;font-weight:800;font-size:17px}
+  #help{font-size:12.5px;color:#6e7883;text-align:center;line-height:1.8}
+  #help b{color:#a9b2bd;font-weight:600}
+  kbd{display:inline-block;padding:1px 6px;border:1px solid #333b45;border-radius:4px;
+    background:#151920;color:#9aa4b0;font-size:11.5px;font-family:inherit}
+  #err{position:fixed;inset:0;display:none;place-items:center;padding:40px;
+    background:rgba(20,6,6,.95);color:#e8b4a8;text-align:center;white-space:pre-wrap;font-size:14px}
+</style>
+</head>
+<body>
+<div id="wrap">
+  <div id="stage">
+    <canvas id="cv"></canvas>
+    <div id="hud"></div>
+  </div>
+  <div id="help">
+    <b>마우스</b> 조준 · <b>클릭 유지</b> 연사 · <kbd>R</kbd> 재장전 · <kbd>P</kbd> 다시 시작<br>
+    맞은 자리의 살이 실제로 없어진다 — 팔뚝을 옆으로 훑으면 끊기고, 양팔을 끊으면 참호를 못 때린다
+  </div>
+</div>
+<div id="err"></div>
+<script type="module">
+import { boot } from './game.js';
+try{
+  window.__g = boot(document.getElementById('cv'), document.getElementById('hud'));
+}catch(e){
+  const el = document.getElementById('err');
+  el.style.display = 'grid';
+  el.textContent = '실행 오류\n\n' + (e && e.stack || e);
+}
+</script>
+</body>
+</html>

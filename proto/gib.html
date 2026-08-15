@@ -1,0 +1,514 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>부위 파괴 프로토타입 — 도트 + 픽셀 단위 파괴</title>
+<style>
+  *{margin:0;padding:0;box-sizing:border-box}
+  html,body{height:100%;background:#0b0d10;color:#c9c4b6;
+    font-family:"Pretendard","Malgun Gothic","Segoe UI",sans-serif;overflow:hidden}
+  #wrap{height:100%;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:14px}
+  canvas{display:block;cursor:none;image-rendering:pixelated;
+    box-shadow:0 0 0 1px rgba(200,190,160,.12), 0 20px 60px rgba(0,0,0,.7)}
+  #help{font-size:13px;line-height:1.9;color:#7e8894;text-align:center}
+  #help b{color:#c9c4b6;font-weight:600}
+  kbd{display:inline-block;padding:1px 7px;border:1px solid #39414c;border-radius:4px;
+    background:#171b21;color:#a8b2be;font-size:12px;font-family:inherit}
+</style>
+</head>
+<body>
+<div id="wrap">
+  <canvas id="view"></canvas>
+  <div id="help">
+    <b>마우스</b> 조준 · <b>클릭 유지</b> 연사 &nbsp;|&nbsp;
+    <kbd>1</kbd><kbd>2</kbd><kbd>3</kbd> 구경 &nbsp; <kbd>R</kbd> 새 좀비 &nbsp; <kbd>X</kbd> 뼈 투시<br>
+    한 곳을 계속 파면 살이 없어지고, 남은 살이 끊기는 순간 그 아래가 통째로 떨어진다
+  </div>
+</div>
+<script>
+/* ══════════════════════════════════════════════════════════════════
+   부위 파괴 프로토타입
+
+   부위마다 체력을 두고 0 이 되면 떼어내는 방식이 아니다.
+   부위마다 "픽셀 점유 격자"를 하나씩 들고, 총알은 그 격자에서 재료를
+   실제로 파낸다. 파낸 뒤 관절에서 연결 성분을 훑어, 더 이상 관절과
+   이어지지 않는 덩어리를 떨어뜨린다.
+
+   그래서 임계점을 숫자로 정하지 않는다 — 팔뚝을 가로로 훑으면 잘리고,
+   가운데만 파면 아직 붙어 있고, 한 발 더 맞으면 그때 떨어진다.
+   규칙이 아니라 결과다.
+
+   이 방식이 감당되는 이유는 해상도가 작아서다. 부위 하나가 8×30,
+   즉 240칸이라 연결 성분 검사 한 번이 240 연산이다.
+   ══════════════════════════════════════════════════════════════════ */
+
+/* ── 화면 ─────────────────────────────────────────────────────── */
+const LW = 152, LH = 122;                 // 논리 해상도(도트 단위)
+const SCALE = 6;
+const view = document.getElementById('view');
+view.width = LW * SCALE; view.height = LH * SCALE;
+const vctx = view.getContext('2d');
+vctx.imageSmoothingEnabled = false;
+
+// 도트는 이 작은 캔버스에 그리고, 마지막에 통째로 확대해 얹는다
+const px = document.createElement('canvas');
+px.width = LW; px.height = LH;
+const ctx = px.getContext('2d');
+ctx.imageSmoothingEnabled = false;
+
+const GROUND = 110;
+
+/* ── 재료 ─────────────────────────────────────────────────────────
+   0 빈칸 · 1 겉면 · 2 겉면 그늘 · 3 살 · 4 뼈
+   겉면 아래에 살과 뼈를 미리 깔아두면, 파인 자리에서 저절로 속살이 나온다.
+   겉 스프라이트와 속 스프라이트를 따로 그릴 필요가 없다. */
+const GONE = 0, SURF = 1, SHADE = 2, FLESH = 3, BONE = 4;
+const FLESH_C = ['#7c211d', '#5d1613'];
+const BONE_C  = ['#ded7bd', '#b3ab8e'];
+
+/* ── 마스크 만들기 ────────────────────────────────────────────── */
+function rrect(w, h, r){                        // 모서리 둥근 사각형
+  const s = new Uint8Array(w*h);
+  for(let y=0;y<h;y++) for(let x=0;x<w;x++){
+    const cx = x < r ? r : (x > w-1-r ? w-1-r : x);
+    const cy = y < r ? r : (y > h-1-r ? h-1-r : y);
+    if((x-cx)*(x-cx) + (y-cy)*(y-cy) <= r*r + 0.6) s[y*w+x] = 1;
+  }
+  return s;
+}
+/* 각 칸이 겉면에서 몇 칸 안쪽인지 — 침식으로 잰다 */
+function depthMap(shape, w, h){
+  const d = new Int16Array(w*h).fill(-1);
+  let cur = [];
+  for(let y=0;y<h;y++) for(let x=0;x<w;x++){
+    const i = y*w+x;
+    if(!shape[i]) continue;
+    let edge = false;
+    if(x===0||y===0||x===w-1||y===h-1) edge = true;
+    else if(!shape[i-1]||!shape[i+1]||!shape[i-w]||!shape[i+w]) edge = true;
+    if(edge){ d[i] = 0; cur.push(i); }
+  }
+  let lvl = 0;
+  while(cur.length){
+    const next = [];
+    for(const i of cur){
+      const x = i % w, y = (i / w) | 0;
+      if(x>0   && shape[i-1] && d[i-1]<0){ d[i-1] = lvl+1; next.push(i-1); }
+      if(x<w-1 && shape[i+1] && d[i+1]<0){ d[i+1] = lvl+1; next.push(i+1); }
+      if(y>0   && shape[i-w] && d[i-w]<0){ d[i-w] = lvl+1; next.push(i-w); }
+      if(y<h-1 && shape[i+w] && d[i+w]<0){ d[i+w] = lvl+1; next.push(i+w); }
+    }
+    cur = next; lvl++;
+  }
+  return d;
+}
+/* 깊이에 따라 겉면·살·뼈를 배치한다. 뼈는 부위 한가운데를 세로로 지난다. */
+function materialize(shape, w, h, boned){
+  const d = depthMap(shape, w, h);
+  const m = new Uint8Array(w*h);
+  const cx = (w-1)/2;
+  for(let y=0;y<h;y++) for(let x=0;x<w;x++){
+    const i = y*w+x;
+    if(!shape[i]) continue;
+    if(d[i] === 0)      m[i] = SURF;
+    else if(d[i] === 1) m[i] = SHADE;
+    else                m[i] = (boned && Math.abs(x-cx) < Math.max(0.9, w*0.17)) ? BONE : FLESH;
+  }
+  return m;
+}
+
+/* ── 부위 정의 ────────────────────────────────────────────────────
+   pj  : 부모(몸통) 안에서 이 부위가 붙는 자리
+   j   : 이 부위 안에서 관절이 있는 자리 — 연결성 검사의 출발점이다
+   sag : 살이 없어질수록 이 각도까지 처진다 */
+const SPEC = [
+  {name:'다리L', w:10, h:30, r:4, col:['#3a4054','#282d3d'], boned:true,  pj:[8, 32],  j:[5,1],  sag: 0.55, z:0},
+  {name:'다리R', w:10, h:30, r:4, col:['#343a4c','#232838'], boned:true,  pj:[17,32],  j:[5,1],  sag:-0.55, z:0},
+  {name:'몸통',  w:26, h:34, r:6, col:['#46543a','#33402b'], boned:true,  pj:null,     j:[13,17],sag: 0,    z:1},
+  {name:'머리',  w:16, h:17, r:7, col:['#98a07e','#7a8263'], boned:false, pj:[13, 1],  j:[8,15], sag: 0.5,  z:2},
+  {name:'팔L',   w:8,  h:31, r:3, col:['#8f9776','#71795c'], boned:true,  pj:[2, 8],   j:[4,2],  sag: 0.9,  z:3},
+  {name:'팔R',   w:8,  h:31, r:3, col:['#868e6e','#6a7255'], boned:true,  pj:[24,8],   j:[4,2],  sag:-0.9,  z:3},
+];
+
+let parts, gibs, debris, dead, seeThrough = false, caliber = 1;
+
+function makeZombie(){
+  parts = SPEC.map(s=>{
+    const shape = rrect(s.w, s.h, s.r);
+    const mask  = materialize(shape, s.w, s.h, s.boned);
+    let orig = 0;
+    for(let i=0;i<mask.length;i++) if(mask[i]) orig++;
+    return {
+      ...s, mask, orig, alive: orig,
+      ang: 0, detached: false,
+      cv: null, dirty: true,          // 다치기 전엔 캔버스를 만들지 않는다
+    };
+  });
+  gibs = []; debris = []; dead = false;
+}
+
+/* 몸통은 좌표계의 뿌리다. 화면상 위치를 여기서 정한다. */
+const ROOT = {x: (LW>>1) - 13, y: GROUND - 32 - 34};     // 몸통 좌상단
+function torso(){ return parts[2]; }
+
+/* 부위의 관절이 화면 어디에 있는지 */
+function jointWorld(p){
+  if(!p.pj) return {x: ROOT.x + p.j[0], y: ROOT.y + p.j[1]};
+  return {x: ROOT.x + p.pj[0], y: ROOT.y + p.pj[1]};
+}
+/* 화면 좌표 → 부위 안 좌표 (관절을 축으로 되돌린다) */
+function toLocal(p, wx, wy){
+  const jw = jointWorld(p);
+  const dx = wx - jw.x, dy = wy - jw.y;
+  const c = Math.cos(-p.ang), s = Math.sin(-p.ang);
+  return {x: dx*c - dy*s + p.j[0], y: dx*s + dy*c + p.j[1]};
+}
+
+/* ── 파내기 ───────────────────────────────────────────────────── */
+function carve(p, lx, ly, rad){
+  const {w, h, mask} = p;
+  let removed = 0;
+  const jw = jointWorld(p);
+  const c = Math.cos(p.ang), s = Math.sin(p.ang);
+  for(let y = Math.floor(ly-rad); y <= ly+rad; y++){
+    for(let x = Math.floor(lx-rad); x <= lx+rad; x++){
+      if(x<0||y<0||x>=w||y>=h) continue;
+      const i = y*w+x;
+      if(!mask[i]) continue;
+      const dx = x-lx, dy = y-ly, dist = Math.hypot(dx, dy);
+      if(dist > rad) continue;
+      // 가장자리는 확률적으로 남겨서 파인 자리가 원이 아니라 너덜해지게
+      if(dist > rad*0.55 && Math.random() < (dist/rad - 0.55)*1.7) continue;
+      // 뼈는 더 잘 버틴다 — 뼈가 남아 팔이 덜렁거리는 그림이 나온다
+      if(mask[i] === BONE && Math.random() < 0.55) continue;
+
+      // 없어진 칸을 그 자리 색 그대로 파편으로 날린다 — "부서졌다"는 이게 판다
+      const col = matColor(p, mask[i]);
+      const lx0 = x - p.j[0], ly0 = y - p.j[1];
+      const wx = jw.x + lx0*c - ly0*s, wy = jw.y + lx0*s + ly0*c;
+      if(debris.length < 1400){
+        const a = Math.atan2(dy, dx) + (Math.random()-0.5)*1.2;
+        const v = 12 + Math.random()*46;
+        debris.push({x:wx, y:wy, vx:Math.cos(a)*v, vy:Math.sin(a)*v - 26, c:col, life:1});
+      }
+      mask[i] = GONE; removed++;
+    }
+  }
+  if(removed){ p.alive -= removed; p.dirty = true; }
+  return removed;
+}
+
+/* ── 연결성: 관절에서 닿지 않는 덩어리는 떨어진다 ────────────────
+   부위 하나가 수백 칸이라 매번 전수 훑어도 값이 거의 안 나간다. */
+function settle(p){
+  const {w, h, mask} = p;
+  const seen = new Uint8Array(w*h);
+  const stack = [];
+  // 출발점 = 관절이 있는 줄에 아직 남아 있는 칸
+  const jy = p.j[1];
+  for(let dy=-1; dy<=1; dy++){
+    const y = jy + dy;
+    if(y<0||y>=h) continue;
+    for(let x=0;x<w;x++){
+      const i = y*w+x;
+      if(mask[i] && !seen[i]){ seen[i] = 1; stack.push(i); }
+    }
+  }
+  let held = stack.length;
+  while(stack.length){
+    const i = stack.pop();
+    const x = i % w;
+    if(x>0   && mask[i-1] && !seen[i-1]){ seen[i-1]=1; held++; stack.push(i-1); }
+    if(x<w-1 && mask[i+1] && !seen[i+1]){ seen[i+1]=1; held++; stack.push(i+1); }
+    if(i>=w  && mask[i-w] && !seen[i-w]){ seen[i-w]=1; held++; stack.push(i-w); }
+    if(i<w*(h-1) && mask[i+w] && !seen[i+w]){ seen[i+w]=1; held++; stack.push(i+w); }
+  }
+
+  // 관절과 끊긴 칸들을 덩어리째 떼어낸다
+  if(held < p.alive){
+    const comp = new Int32Array(w*h).fill(-1);
+    let n = 0;
+    for(let i=0;i<w*h;i++){
+      if(!mask[i] || seen[i] || comp[i] >= 0) continue;
+      const id = n++, cells = [];
+      const st = [i]; comp[i] = id;
+      while(st.length){
+        const k = st.pop(); cells.push(k);
+        const x = k % w;
+        if(x>0   && mask[k-1] && !seen[k-1] && comp[k-1]<0){ comp[k-1]=id; st.push(k-1); }
+        if(x<w-1 && mask[k+1] && !seen[k+1] && comp[k+1]<0){ comp[k+1]=id; st.push(k+1); }
+        if(k>=w  && mask[k-w] && !seen[k-w] && comp[k-w]<0){ comp[k-w]=id; st.push(k-w); }
+        if(k<w*(h-1) && mask[k+w] && !seen[k+w] && comp[k+w]<0){ comp[k+w]=id; st.push(k+w); }
+      }
+      spawnGib(p, cells);
+      for(const k of cells) mask[k] = GONE;
+    }
+    p.alive = held; p.dirty = true;
+    if(p.alive === 0) p.detached = true;         // 관절 줄까지 날아가 통째로 떨어진 경우
+  }
+
+  // 남은 살이 얼마 없으면 그만큼 처진다 — 떨어지기 전에 눈에 보여야 한다
+  if(p.sag){
+    const t = 1 - p.alive / p.orig;
+    p.ang = p.sag * Math.min(1, t*1.35) * Math.min(1, t*1.35);
+  }
+
+  // 관절 줄이 통째로 날아가면 붙잡을 게 없다 = 부위 전체가 떨어진다
+  if(p.alive > 0 && held === 0) detachWhole(p);
+}
+
+/* 끊긴 덩어리를 독립 조각으로 던진다 */
+function spawnGib(p, cells){
+  const {w, h, mask} = p;
+  let x0=1e9, y0=1e9, x1=-1e9, y1=-1e9;
+  for(const k of cells){
+    const x = k % w, y = (k / w) | 0;
+    if(x<x0)x0=x; if(x>x1)x1=x; if(y<y0)y0=y; if(y>y1)y1=y;
+  }
+  const gw = x1-x0+1, gh = y1-y0+1;
+  const gm = new Uint8Array(gw*gh);
+  for(const k of cells){
+    const x = k % w, y = (k / w) | 0;
+    gm[(y-y0)*gw + (x-x0)] = mask[k];
+  }
+  const jw = jointWorld(p);
+  const c = Math.cos(p.ang), s = Math.sin(p.ang);
+  const lx = x0 - p.j[0], ly = y0 - p.j[1];
+  gibs.push({
+    w:gw, h:gh, mask:gm, col:p.col,
+    x: jw.x + lx*c - ly*s, y: jw.y + lx*s + ly*c,
+    vx:(Math.random()-0.5)*34, vy:-18-Math.random()*26,
+    ang:p.ang, va:(Math.random()-0.5)*5, rest:false, cv:null, dirty:true,
+  });
+}
+function detachWhole(p){
+  const cells = [];
+  for(let i=0;i<p.mask.length;i++) if(p.mask[i]) cells.push(i);
+  if(cells.length) spawnGib(p, cells);
+  for(const k of cells) p.mask[k] = GONE;
+  p.alive = 0; p.detached = true; p.dirty = true;
+}
+
+/* ── 사격 ─────────────────────────────────────────────────────── */
+const CAL = [{r:2.0, n:'소구경'}, {r:3.2, n:'보통'}, {r:5.0, n:'대구경'}];
+let aim = {x: LW/2, y: 90}, down = false, cool = 0, flash = 0;
+
+function fire(){
+  flash = 1;
+  const rad = CAL[caliber].r;
+  // 앞에 있는 부위부터 본다 (팔 → 머리 → 몸통 → 다리)
+  const order = [...parts].sort((a,b)=> b.z - a.z);
+  for(const p of order){
+    if(p.detached || p.alive <= 0) continue;
+    const l = toLocal(p, aim.x, aim.y);
+    const ix = Math.round(l.x), iy = Math.round(l.y);
+    if(ix<0||iy<0||ix>=p.w||iy>=p.h) continue;
+    if(!p.mask[iy*p.w+ix]) continue;          // 이미 파인 자리는 통과시킨다
+    carve(p, l.x, l.y, rad);
+    settle(p);
+    if(p === torso() && p.alive < p.orig*0.34 && !dead) collapse();
+    return;
+  }
+  // 아무것도 안 맞으면 흙먼지
+  for(let i=0;i<5;i++){
+    if(aim.y > GROUND-3 && debris.length < 1400)
+      debris.push({x:aim.x, y:GROUND, vx:(Math.random()-0.5)*40, vy:-20-Math.random()*30,
+                   c:'#3a3228', life:1});
+  }
+}
+/* 몸통 척추가 끊기면 전부 무너진다 */
+function collapse(){
+  dead = true;
+  for(const p of parts) if(!p.detached && p.alive > 0) detachWhole(p);
+}
+
+/* ── 색 ───────────────────────────────────────────────────────── */
+function matColor(p, m){
+  if(m === SURF)  return p.col[0];
+  if(m === SHADE) return p.col[1];
+  if(m === FLESH) return FLESH_C[0];
+  if(m === BONE)  return BONE_C[0];
+  return '#000';
+}
+/* 마스크를 자기 캔버스에 굽는다 — 다친 프레임에만 다시 굽는다(복사는 다칠 때만)
+
+   속살과 뼈는 재료로는 늘 거기 있지만 **지금 겉으로 드러난 칸에서만** 보인다.
+   그래서 멀쩡한 부위는 살색 실루엣이고, 파인 자리에서만 붉은 속과 뼈가 나온다 —
+   겉 스프라이트와 속 스프라이트를 따로 그리지 않고도 상처가 생긴다. */
+function bake(o){
+  if(!o.cv){ o.cv = document.createElement('canvas'); o.cv.width = o.w; o.cv.height = o.h; }
+  const c = o.cv.getContext('2d');
+  const {w, h, mask} = o;
+  const img = c.createImageData(w, h);
+  const d = img.data;
+  for(let y=0;y<h;y++) for(let x=0;x<w;x++){
+    const i = y*w+x, m = mask[i];
+    if(!m) continue;
+    const edge = x===0 || y===0 || x===w-1 || y===h-1
+              || !mask[i-1] || !mask[i+1] || !mask[i-w] || !mask[i+w];
+    let hex;
+    if(seeThrough)        hex = m === BONE ? BONE_C[0] : (m === FLESH ? '#3b2321' : '#252a22');
+    else if(!edge)        hex = o.col[0];                    // 아직 살갗에 덮인 안쪽
+    else if(m === BONE)   hex = BONE_C[(x+y) & 1];           // 드러난 뼈
+    else if(m === FLESH)  hex = FLESH_C[(x+y) & 1];          // 드러난 속살
+    else                  hex = o.col[1];                    // 원래부터 겉이던 테두리
+    const v = parseInt(hex.slice(1), 16);
+    d[i*4] = (v>>16)&255; d[i*4+1] = (v>>8)&255; d[i*4+2] = v&255; d[i*4+3] = 255;
+  }
+  c.putImageData(img, 0, 0);
+  o.dirty = false;
+}
+function blit(o, wx, wy, ang, jx, jy){
+  if(o.dirty) bake(o);
+  ctx.save();
+  ctx.translate(wx, wy);
+  if(ang) ctx.rotate(ang);
+  ctx.drawImage(o.cv, -jx, -jy);
+  ctx.restore();
+}
+
+/* ── 갱신 ─────────────────────────────────────────────────────── */
+function step(dt){
+  if(cool > 0) cool -= dt;
+  if(down && cool <= 0){ fire(); cool = 0.085; }
+  flash = Math.max(0, flash - dt*9);
+
+  for(const d of debris){
+    if(d.life <= 0) continue;
+    d.vy += 190*dt;
+    d.x += d.vx*dt; d.y += d.vy*dt;
+    if(d.y >= GROUND){ d.y = GROUND; d.vx = 0; d.vy = 0; }
+    else d.life = Math.max(0.35, d.life - dt*0.12);
+  }
+  if(debris.length > 1400) debris.splice(0, debris.length - 1400);
+
+  for(const gb of gibs){
+    if(gb.rest) continue;
+    gb.vy += 210*dt;
+    gb.x += gb.vx*dt; gb.y += gb.vy*dt; gb.ang += gb.va*dt;
+    if(gb.y + gb.h >= GROUND){
+      gb.y = GROUND - gb.h; gb.rest = true;
+      gb.ang = Math.round(gb.ang / (Math.PI/2)) * (Math.PI/2);   // 눕힌다
+      for(let i=0;i<10;i++) if(debris.length < 1400)
+        debris.push({x:gb.x+gb.w/2, y:GROUND, vx:(Math.random()-0.5)*50,
+                     vy:-18-Math.random()*24, c:FLESH_C[1], life:1});
+    }
+  }
+}
+
+/* ── 그리기 ───────────────────────────────────────────────────── */
+function draw(){
+  // 배경
+  const sky = ctx.createLinearGradient(0,0,0,GROUND);
+  sky.addColorStop(0, '#14181f'); sky.addColorStop(1, '#1d2028');
+  ctx.fillStyle = sky; ctx.fillRect(0,0,LW,GROUND);
+  ctx.fillStyle = '#241f1a'; ctx.fillRect(0, GROUND, LW, LH-GROUND);
+  ctx.fillStyle = '#2c261f'; ctx.fillRect(0, GROUND, LW, 1);
+
+  // 바닥에 쌓인 파편
+  for(const d of debris){
+    ctx.globalAlpha = d.life;
+    ctx.fillStyle = d.c;
+    ctx.fillRect(Math.round(d.x), Math.round(d.y), 1, 1);
+  }
+  ctx.globalAlpha = 1;
+
+  // 떨어져 나간 조각
+  for(const gb of gibs) blit(gb, gb.x, gb.y, gb.ang, 0, 0);
+
+  // 몸에 붙어 있는 부위 — 뒤쪽(다리·몸통)부터
+  for(const p of [...parts].sort((a,b)=> a.z - b.z)){
+    if(p.detached || p.alive <= 0) continue;
+    const jw = jointWorld(p);
+    blit(p, jw.x, jw.y, p.ang, p.j[0], p.j[1]);
+  }
+
+  // 조준선
+  ctx.fillStyle = flash > 0.2 ? '#ffe6a8' : '#d8543e';
+  ctx.fillRect(Math.round(aim.x)-3, Math.round(aim.y), 2, 1);
+  ctx.fillRect(Math.round(aim.x)+2, Math.round(aim.y), 2, 1);
+  ctx.fillRect(Math.round(aim.x), Math.round(aim.y)-3, 1, 2);
+  ctx.fillRect(Math.round(aim.x), Math.round(aim.y)+2, 1, 2);
+
+  // 확대해서 화면에 얹는다
+  vctx.imageSmoothingEnabled = false;
+  vctx.clearRect(0,0,view.width,view.height);
+  vctx.drawImage(px, 0, 0, view.width, view.height);
+
+  drawHud();
+}
+
+/* 부위별 남은 살 — "임계점이 보여야 한다"를 위한 계기판 */
+function drawHud(){
+  const S = SCALE;
+  vctx.font = '600 12px "Pretendard","Malgun Gothic",sans-serif';
+  vctx.textAlign = 'left';
+  let y = 12;
+  vctx.fillStyle = 'rgba(10,12,15,.72)';
+  vctx.fillRect(8, 6, 150, 8 + SPEC.length*17 + 20);
+  for(const p of parts){
+    const f = p.orig ? p.alive / p.orig : 0;
+    vctx.fillStyle = '#79828e';
+    vctx.fillText(p.name, 16, y + 14);
+    vctx.fillStyle = '#20252c';
+    vctx.fillRect(58, y + 5, 90, 8);
+    vctx.fillStyle = p.detached ? '#4a2422' : (f < 0.3 ? '#d8543e' : f < 0.6 ? '#d9a441' : '#5f8f5a');
+    vctx.fillRect(58, y + 5, 90*f, 8);
+    if(p.detached){
+      vctx.fillStyle = '#d8543e';
+      vctx.fillText('절단', 112, y + 14);
+    }
+    y += 17;
+  }
+  vctx.fillStyle = '#79828e';
+  vctx.fillText(`구경 ${CAL[caliber].n} · 조각 ${gibs.length}`, 16, y + 14);
+  if(dead){
+    vctx.fillStyle = '#d8543e';
+    vctx.font = '800 22px "Pretendard","Malgun Gothic",sans-serif';
+    vctx.textAlign = 'center';
+    vctx.fillText('척추 절단 — 붕괴', view.width/2, 46);
+  }
+}
+
+/* ── 입력 ─────────────────────────────────────────────────────── */
+function localFromEvent(e){
+  const r = view.getBoundingClientRect();
+  aim.x = (e.clientX - r.left) / (r.width / LW);
+  aim.y = (e.clientY - r.top)  / (r.height / LH);
+}
+view.addEventListener('mousemove', localFromEvent);
+view.addEventListener('mousedown', e=>{ localFromEvent(e); down = true; });
+addEventListener('mouseup', ()=> down = false);
+addEventListener('keydown', e=>{
+  const k = e.key.toLowerCase();
+  if(k === 'r') makeZombie();
+  if(k === 'x'){ seeThrough = !seeThrough; for(const p of parts) p.dirty = true;
+                 for(const gb of gibs) gb.dirty = true; }
+  if(k >= '1' && k <= '3') caliber = +k - 1;
+});
+
+/* ── 루프 ─────────────────────────────────────────────────────── */
+makeZombie();
+let last = performance.now();
+function loop(now){
+  const dt = Math.min(0.05, (now - last)/1000); last = now;
+  step(dt); draw();
+  requestAnimationFrame(loop);
+}
+requestAnimationFrame(loop);
+
+/* ── 헤드리스 확인용 ──────────────────────────────────────────── */
+window.__demo = {
+  reset: makeZombie,
+  cal(i){ caliber = i; },
+  shoot(x, y, n){ for(let i=0;i<n;i++){ aim.x = x; aim.y = y; fire(); step(1/60); } },
+  step(n){ for(let i=0;i<n;i++) step(1/60); },
+  draw,
+  png(){ draw(); return view.toDataURL('image/png'); },
+  state(){ return parts.map(p=>({ 부위:p.name, 남은살:p.alive, 원래:p.orig,
+            비율:+(p.alive/p.orig).toFixed(2), 절단:p.detached })).concat([{조각:gibs.length}]); },
+};
+</script>
+</body>
+</html>

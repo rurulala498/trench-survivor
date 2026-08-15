@@ -1,0 +1,24 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>참호 사수 — TRENCH SURVIVOR</title>
+<style>
+  *{margin:0;padding:0;box-sizing:border-box}
+  html,body{height:100%;overflow:hidden;
+    font-family:"Pretendard","Malgun Gothic","Segoe UI",sans-serif;color:#e8e4d8}
+  /* 레터박스 여백도 배경의 일부로 — 캔버스 밖이 그냥 검은 판이 되지 않게 */
+  body{background:
+    radial-gradient(120% 90% at 50% 42%, #12161c 0%, #090b0f 55%, #050607 100%)}
+  #wrap{position:relative;width:100vw;height:100vh;display:flex;align-items:center;justify-content:center}
+  canvas{display:block;image-rendering:auto;cursor:none;
+    box-shadow:0 0 0 1px rgba(198,184,142,.10), 0 26px 90px rgba(0,0,0,.85)}
+</style>
+</head>
+<body>
+<div id="wrap"><canvas id="cv"></canvas></div>
+<div id="fatal"></div>
+<script type="module" src="/src/main.ts"></script>
+</body>
+</html>
